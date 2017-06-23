@@ -7,21 +7,51 @@
 
 # Summary
 
-Add support for change feeds in CockroachDB, as an Apache Kafka
-publisher, providing at-least-once delivery semantics.
+Add a basic building block for change feeds which, given a (sufficiently recent) HLC timestamp and a set of key spans returns a stream-based connection that
+
+1. eagerly delivers updates that affect any of the given key spans, and
+1. periodically delivers "closed timestamps", i.e. tuples `(timestamp,
+   key_range)` where receiving `(ts1, [a,b))` guarantees that no future update
+   affecting `[a,b)` will be sent for a timestamp less than `ts1`.
 
 # Motivation
 
-Change feeds are a requested feature for CockroachDB. Many databases
-have various features for propagating database updates to external
-sinks eagerly. Currently, however, the only way to get data out of
-CockroachDB is via SQL `SELECT` queries, or Backups (enterprise
-only). Furthermore, `SELECT` queries at the SQL layer do not support
-incremental reads, so polling through SQL is inefficient for data that
-is not strictly ordered.
+Many databases have various features for propagating database updates to
+external sinks eagerly. Currently, however, the only way to get data out of
+CockroachDB is via SQL `SELECT` queries, `./cockroach dump`, or Backups
+(enterprise only). Furthermore, `SELECT` queries at the SQL layer do not support
+incremental reads, so polling through SQL is inefficient for data that is not
+strictly ordered. Change feeds are one of the more frequently requested features
+for CockroachDB.
 
-Change feeds are also a requirement for efficiently supporting
-incrementally updated materialized views.
+Our motivating use cases are:
+
+- wait for updates on individual rows or small spans in a table. For example, if
+  a branch is pushed while its diff is viewed on Github, a notification will pop
+  up in the browser to alert the user that the diff they're viewing has changed. This kind of functionality should be easy to achieve when using CockroachDB.
+- stream updates to a table or database into an external system, for example Kafka, with at-least-once semantics. This is also known as Change Data Capture (CDC).
+- implement efficient incrementally updated materialized views.
+
+The above use cases were key in informing the design of the basic building block presented here: We
+
+- initiate change feeds using a HLC timestamp since that is the right primitive for connecting the "initial state" (think `SELECT * FROM ...` or `INSERT ... RETURNING CURRENT_TIMESTAMP()`) to the stream of updates.
+- chose to operate on a set of key ranges since that captures both collections of individual keys, sets of tables, or whole databases (CDT).
+- require close notifications because often, a higher-level system needs to buffer updates until is knows that older data won't change any more; a simple example is wanting to output updates in timestamp-sorted order. More generally, close notifications enable check pointing for the case in which a change feed disconnects (which would not be uncommon with large key spans).
+- emit close notifications with attached key ranges since that is a natural consequence of the Range-based sharding in CockroachDB, and fine-grained information is always preferrable. When not necessary, the key range can be processed away by an intermediate stage that tracks the minimum closed timestamp over all tracked key spans and emits that (with a global key range) whenever it changes.
+- make the close notification threshold configurable via `ZoneConfig`s (though this is really a requirement we impose on [16593][followerreads]). Fast close notifications (which allow consumers to operate more efficiently) correspond to disabling long transactions, which we must not impose globally.
+- aim to serve change feeds from follower replicas (hence the connection to [16593][followerreads]).
+- make the protocol efficient enough to poll whole databases in practice.
+
+Note that the consumers of this primitive are always going to be CockroachDB-internal subsystems that consume raw data (similar to a stream of `WriteBatch`). We propose here a design for the core layer primitive, and the higher-level subsystems are out of scope.
+
+# Detailed design
+
+## Replica-level [wip]
+
+All Replicas accept a new `ChangeFeed` command which contains a timestamp and (in the usual header) a key range for which updates are to be delivered. The `ChangeFeed` command first grabs `raftMu`, notes the current applied log index, opens a RocksDB snapshot, registers itself with the raft processing goroutine and releases `raftMu` again. By registering itself, it receives all future `WriteBatch`es which apply to the replica
+
+
+
 
 # Background and Related Work
 
@@ -361,3 +391,12 @@ pair, and the standard cartesian product partial order on tuples of
 pairs.
 
 <definitely work through an example here>
+
+# Unresolved Questions
+
+## Licensing
+
+We will have to figure out what's CCL and what's OSS. Intuitively CDT sounds like it could be an enterprise feature and single-column watches should be OSS. However, there's a lot in between, and the primitive presented here is shared between all of them.
+
+
+[followerreads]: https://github.com/cockroachdb/cockroach/issues/16593
